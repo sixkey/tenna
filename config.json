@@ -1,14 +1,8 @@
 {
-    "buttons": {
-        "0": "media/video.mp4",
-        "1": "media/sound.mp3",
-        "2": "media/sound.mp3",
-        "3": "media/sound.mp3"
-    },
-    "directions": {
-        "up":    "media/video.mp4",
-        "down":  "media/video.mp4",
-        "left":  "media/sound.mp3",
-        "right": "media/video.mp4"
-    }
+  "idle": "media/idle.mp4",
+  "blank": "media/blank.png",
+  "buttons": {
+    "0": "media/video.mp4",
+    "1": "media/blink.mp4"
+  }
 }

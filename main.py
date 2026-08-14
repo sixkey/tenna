@@ -1,657 +1,243 @@
 #!/usr/bin/env python3
+"""Controller-driven fullscreen video player for Raspberry Pi.
+
+Pygame handles controller input.  mpv is started once in fullscreen idle mode
+and receives commands through its local IPC socket, so changing media never
+creates another player window.
+"""
+
+from __future__ import annotations
 
 import json
 import os
+import shutil
+import socket
+import subprocess
 import sys
+import time
+from pathlib import Path
 
 import pygame
-import gi
 
-gi.require_version("Gst", "1.0")
-gi.require_version("GstVideo", "1.0")
 
-from gi.repository import Gst, GstVideo
+APP_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = APP_DIR / "config.json"
 
 
-CONFIG_FILE = "config.json"
+def load_config() -> tuple[Path, Path, dict[int, Path]]:
+    with CONFIG_PATH.open(encoding="utf-8") as file:
+        config = json.load(file)
 
-
-class GStreamerPlayer:
-    """
-    GStreamer media player.
-
-    A new playbin pipeline is created for each media file.
-    Video is rendered into the existing Pygame X11 window.
-    Audio is rendered through GStreamer.
-    """
-
-    def __init__(self, window_id):
-        Gst.init(None)
-
-        self.window_id = window_id
-        self.player = None
-        self.video_sink = None
-        self.audio_sink = None
-
-        self.current_file = None
-
-    def _create_pipeline(self, has_video):
-        """
-        Create a completely new playbin instance.
-
-        This avoids problems caused by reusing the same playbin
-        after switching between video and audio-only media.
-        """
-
-        player = Gst.ElementFactory.make(
-            "playbin",
-            "player"
-        )
-
-        if player is None:
-            raise RuntimeError(
-                "Unable to create GStreamer playbin."
-            )
-
-        # ------------------------------------------------------
-        # Audio sink
-        # ------------------------------------------------------
-
-        audio_sink = Gst.ElementFactory.make(
-            "autoaudiosink",
-            "audio-sink"
-        )
-
-        if audio_sink is None:
-            raise RuntimeError(
-                "Unable to create GStreamer audio sink."
-            )
-
-        player.set_property(
-            "audio-sink",
-            audio_sink
-        )
-
-        # ------------------------------------------------------
-        # Video sink
-        # ------------------------------------------------------
-
-        if has_video:
-
-            video_sink = Gst.ElementFactory.make(
-                "ximagesink",
-                "video-sink"
-            )
-
-            if video_sink is None:
-                raise RuntimeError(
-                    "Unable to create ximagesink.\n"
-                    "Install gstreamer1.0-x."
-                )
-
-            video_sink.set_property(
-                "force-aspect-ratio",
-                True
-            )
-
-            # Attach video to our existing Pygame window.
-            GstVideo.VideoOverlay.set_window_handle(
-                video_sink,
-                self.window_id
-            )
-
-            player.set_property(
-                "video-sink",
-                video_sink
-            )
-
-        else:
-
-            # Audio-only media should not try to create or
-            # manipulate a video window.
-            video_sink = Gst.ElementFactory.make(
-                "fakesink",
-                "video-sink"
-            )
-
-            player.set_property(
-                "video-sink",
-                video_sink
-            )
-
-        self.player = player
-        self.video_sink = video_sink
-        self.audio_sink = audio_sink
-
-        return player
-
-    def play(self, filename):
-        filename = os.path.abspath(filename)
-
-        if not os.path.isfile(filename):
-            print(
-                f"Media file does not exist: {filename}"
-            )
-            return
-
-        extension = os.path.splitext(
-            filename
-        )[1].lower()
-
-        video_extensions = {
-            ".mp4",
-            ".mkv",
-            ".avi",
-            ".mov",
-            ".webm",
-            ".m4v"
-        }
-
-        has_video = extension in video_extensions
-
-        # ------------------------------------------------------
-        # Completely destroy the previous pipeline.
-        # ------------------------------------------------------
-
-        self.stop()
-
-        # ------------------------------------------------------
-        # Create a fresh pipeline.
-        # ------------------------------------------------------
-
-        try:
-
-            player = self._create_pipeline(
-                has_video
-            )
-
-            uri = Gst.filename_to_uri(
-                filename
-            )
-
-            player.set_property(
-                "uri",
-                uri
-            )
-
-            self.current_file = filename
-
-            print(
-                f"Playing: {filename}"
-            )
-
-            # Start playback.
-            result = player.set_state(
-                Gst.State.PLAYING
-            )
-
-            if result == Gst.StateChangeReturn.FAILURE:
-
-                print(
-                    "GStreamer failed to start playback."
-                )
-
-                self.stop()
-
-        except Exception as error:
-
-            print(
-                f"GStreamer playback error: {error}"
-            )
-
-            self.stop()
-
-    def stop(self):
-        """
-        Completely shut down the current pipeline.
-        """
-
-        if self.player is None:
-            return
-
-        try:
-
-            self.player.set_state(
-                Gst.State.NULL
-            )
-
-            # Wait briefly for the state transition to
-            # complete before destroying the object.
-            self.player.get_state(
-                2 * Gst.SECOND
-            )
-
-        except Exception as error:
-
-            print(
-                f"Error stopping GStreamer: {error}"
-            )
-
-        finally:
-
-            self.player = None
-            self.video_sink = None
-            self.audio_sink = None
-            self.current_file = None
-
-    def process_messages(self):
-        """
-        Process pending GStreamer bus messages.
-        """
-
-        if self.player is None:
-            return
-
-        bus = self.player.get_bus()
-
-        while True:
-
-            message = bus.timed_pop_filtered(
-                0,
-                Gst.MessageType.EOS
-                | Gst.MessageType.ERROR
-                | Gst.MessageType.WARNING
-            )
-
-            if message is None:
-                break
-
-            if message.type == Gst.MessageType.EOS:
-
-                print(
-                    "Playback finished."
-                )
-
-                self.stop()
-
-            elif message.type == Gst.MessageType.ERROR:
-
-                error, debug = message.parse_error()
-
-                print(
-                    f"GStreamer ERROR: {error}",
-                    file=sys.stderr
-                )
-
-                if debug:
-                    print(
-                        f"GStreamer debug: {debug}",
-                        file=sys.stderr
-                    )
-
-                self.stop()
-
-            elif message.type == Gst.MessageType.WARNING:
-
-                warning, debug = message.parse_warning()
-
-                print(
-                    f"GStreamer WARNING: {warning}"
-                )
-
-                if debug:
-                    print(
-                        f"GStreamer debug: {debug}"
-                    )
-
-    def close(self):
-        self.stop()
-
-def load_config():
-    if not os.path.isfile(CONFIG_FILE):
-        raise RuntimeError(
-            f"Missing {CONFIG_FILE}"
-        )
-
-    with open(
-        CONFIG_FILE,
-        "r",
-        encoding="utf-8"
-    ) as file:
-        return json.load(file)
-
-
-def initialize_controller():
-    pygame.joystick.init()
-
-    count = pygame.joystick.get_count()
-
-    if count == 0:
-        raise RuntimeError(
-            "No USB game controller detected."
-        )
-
-    joystick = pygame.joystick.Joystick(0)
-    joystick.init()
-
-    print()
-    print("Controller")
-    print("----------")
-    print(f"Name:    {joystick.get_name()}")
-    print(
-        f"Buttons: {joystick.get_numbuttons()}"
-    )
-    print(
-        f"Axes:    {joystick.get_numaxes()}"
-    )
-    print(
-        f"Hats:    {joystick.get_numhats()}"
-    )
-    print()
-
-    return joystick
-
-
-def get_pygame_window_id():
-    """
-    Return the native X11 window ID used by Pygame.
-
-    GstVideoOverlay.set_window_handle() expects a native
-    window handle. On X11 this is the XID.
-    """
-
-    wm_info = pygame.display.get_wm_info()
-
-    window_id = wm_info.get("window")
-
-    if window_id is None:
-        raise RuntimeError(
-            "Could not obtain the native Pygame window ID.\n"
-            "This demo requires an X11 display."
-        )
-
-    return int(window_id)
-
-
-def handle_hat_motion(event, config, player):
-    """
-    Handle the controller D-pad.
-
-    Pygame normally reports:
-
-        ( 0,  1) = UP
-        ( 0, -1) = DOWN
-        (-1,  0) = LEFT
-        ( 1,  0) = RIGHT
-        ( 0,  0) = released
-    """
-
-    x, y = event.value
-
-    if x == 0 and y == 1:
-        direction = "up"
-
-    elif x == 0 and y == -1:
-        direction = "down"
-
-    elif x == -1 and y == 0:
-        direction = "left"
-
-    elif x == 1 and y == 0:
-        direction = "right"
-
+    # "button" and "video" are kept for the original one-video config.
+    if "buttons" in config:
+        raw_buttons = config["buttons"]
+        if not isinstance(raw_buttons, dict):
+            raise ValueError("'buttons' must be an object of button/video pairs")
+    elif isinstance(config.get("button"), int) and isinstance(config.get("video"), str):
+        raw_buttons = {str(config["button"]): config["video"]}
     else:
-        # This is normally the D-pad being released.
-        return
+        raise ValueError("config.json needs 'buttons', or both 'button' and 'video'")
 
-    media = (
-        config
-        .get("directions", {})
-        .get(direction)
-    )
+    raw_idle = config.get("idle")
+    if not isinstance(raw_idle, str):
+        raise ValueError("config.json must contain an 'idle' video path")
+    idle_video = (APP_DIR / raw_idle).resolve()
+    if not idle_video.is_file():
+        raise FileNotFoundError(f"Idle video does not exist: {idle_video}")
 
-    if media is None:
-        print(
-            f"No media configured for D-pad: {direction}"
+    raw_blank = config.get("blank")
+    if not isinstance(raw_blank, str):
+        raise ValueError("config.json must contain a 'blank' image path")
+    blank_image = (APP_DIR / raw_blank).resolve()
+    if not blank_image.is_file():
+        raise FileNotFoundError(f"Blank image does not exist: {blank_image}")
+
+    buttons = {}
+    for raw_button, raw_video in raw_buttons.items():
+        try:
+            button = int(raw_button)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Invalid controller button: {raw_button!r}") from error
+        if not isinstance(raw_video, str):
+            raise ValueError(f"Video for button {button} must be a string")
+        video = (APP_DIR / raw_video).resolve()
+        if not video.is_file():
+            raise FileNotFoundError(f"Video does not exist: {video}")
+        buttons[button] = video
+
+    if not buttons:
+        raise ValueError("At least one controller button must be configured")
+    return idle_video, blank_image, buttons
+
+
+class MpvPlayer:
+    """A single persistent fullscreen mpv process controlled by JSON IPC."""
+
+    def __init__(self, blank_image: Path) -> None:
+        self.socket_path = Path(f"/tmp/tenna-mpv-{os.getpid()}.sock")
+        self.blank_image = blank_image
+        self.process = None
+
+    def start(self) -> None:
+        self.process = subprocess.Popen(
+            [
+                "mpv",
+                # This is a dedicated display appliance. Do not load a
+                # desktop MPV configuration or its UI scripts.
+                "--no-config",
+                # The built-in OSC script renders the idle message even when
+                # OSD is disabled, so turn the script itself off.
+                "--osc=no",
+                "--fs",
+                "--idle=yes",
+                "--force-window=yes",
+                # Prevent MPV's pseudo-GUI idle overlay ("Drop files or URLs
+                # to play here") when the app is launched without a terminal.
+                "--player-operation-mode=cplayer",
+                "--osd-level=0",
+                "--image-display-duration=inf",
+                # After a triggered video reaches EOF, mpv must return to its
+                # idle state so the event loop can reload idle.mp4.
+                "--keep-open=no",
+                "--really-quiet",
+                f"--input-ipc-server={self.socket_path}",
+                str(self.blank_image),
+            ],
+            stdin=subprocess.DEVNULL,
         )
-        return
 
-    print(f"D-pad: {direction}")
+        deadline = time.monotonic() + 5
+        while not self.socket_path.exists():
+            if self.process.poll() is not None:
+                raise RuntimeError("mpv exited before its control socket was ready")
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Timed out while starting mpv")
+            time.sleep(0.05)
 
-    player.play(media)
+    def command(self, command: list) -> None:
+        payload = (json.dumps({"command": command}) + "\n").encode("utf-8")
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            connection.connect(str(self.socket_path))
+            connection.sendall(payload)
+        finally:
+            connection.close()
 
-ANALOG_DEADZONE = 0.5
+    def is_idle(self) -> bool:
+        """Return whether mpv has finished its current non-looping file."""
+        payload = (json.dumps({"command": ["get_property", "idle-active"],
+                              "request_id": 1}) + "\n").encode("utf-8")
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            connection.settimeout(2)
+            connection.connect(str(self.socket_path))
+            connection.sendall(payload)
+            received = b""
+            while True:
+                while b"\n" in received:
+                    raw_response, received = received.split(b"\n", 1)
+                    response = json.loads(raw_response)
+                    # MPV broadcasts events such as "start-file" to IPC
+                    # clients. Only the response with our request ID answers
+                    # the get_property command.
+                    if response.get("request_id") != 1:
+                        continue
+                    if response.get("error") != "success":
+                        raise RuntimeError(f"mpv IPC error: {response.get('error')}")
+                    return bool(response.get("data"))
+
+                chunk = connection.recv(4096)
+                if not chunk:
+                    raise RuntimeError("mpv closed its control socket")
+                received += chunk
+        finally:
+            connection.close()
+
+    def play(self, video: Path, loop: bool = False) -> None:
+        # "replace" seamlessly changes the current video in the existing
+        # fullscreen mpv window.
+        self.command(["set_property", "loop-file", "inf" if loop else "no"])
+        self.command(["loadfile", str(video), "replace"])
+
+    def close(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        self.socket_path.unlink(missing_ok=True)
 
 
-class DirectionController:
-    def __init__(self):
-        self.direction = None
-
-    def process_axis(self, event):
-        """
-        Convert analog axis input into a logical direction.
-
-        Returns:
-            "up"
-            "down"
-            "left"
-            "right"
-            None
-        """
-
-        value = event.value
-
-        # Ignore the small fluctuations around center.
-        if abs(value) < ANALOG_DEADZONE:
-            return None
-
-        if event.axis == 0:
-
-            if value < 0:
-                return "left"
-
-            return "right"
-
-        if event.axis == 1:
-
-            if value < 0:
-                return "up"
-
-            return "down"
-
+def open_first_controller():
+    pygame.joystick.init()
+    if pygame.joystick.get_count() == 0:
         return None
-
-    def update(self, event):
-        """
-        Return a direction only when entering a new direction.
-
-        This prevents a held direction from repeatedly
-        restarting the same media.
-        """
-
-        direction = self.process_axis(event)
-
-        # Stick returned to center.
-        if direction is None:
-            self.direction = None
-            return None
-
-        # Direction hasn't changed.
-        if direction == self.direction:
-            return None
-
-        # New direction.
-        self.direction = direction
-
-        return direction
+    controller = pygame.joystick.Joystick(0)
+    controller.init()
+    print(f"Controller: {controller.get_name()}")
+    return controller
 
 
-def main():
+def main() -> int:
+    if shutil.which("mpv") is None:
+        raise RuntimeError("mpv is not installed. Install it with: sudo apt install mpv")
 
-    config = load_config()
-
+    idle_video, blank_image, buttons = load_config()
     pygame.init()
+    # This tiny, minimized Pygame window keeps SDL's controller event queue
+    # active while mpv owns the visible fullscreen window.
+    pygame.display.set_mode((1, 1))
+    pygame.display.iconify()
+    controller = open_first_controller()
+    if controller is None:
+        print("No controller detected. Space plays the first configured video.")
 
-    # ----------------------------------------------------------
-    # Create ONE fullscreen Pygame window.
-    # ----------------------------------------------------------
-
-    screen = pygame.display.set_mode(
-        (0, 0),
-        pygame.FULLSCREEN
-    )
-
-    pygame.display.set_caption(
-        "Controller Media Player"
-    )
-
-    pygame.mouse.set_visible(False)
-
-    # Make the initial screen black.
-    screen.fill((0, 0, 0))
-    pygame.display.flip()
-
-    # ----------------------------------------------------------
-    # Get the native X11 window ID.
-    # ----------------------------------------------------------
-
-    window_id = get_pygame_window_id()
-
-    print(
-        f"Pygame native window ID: {window_id}"
-    )
-
-    # ----------------------------------------------------------
-    # Controller
-    # ----------------------------------------------------------
-
-    joystick = initialize_controller()
-
-    # ----------------------------------------------------------
-    # GStreamer
-    # ----------------------------------------------------------
-
-    player = GStreamerPlayer(
-        window_id
-    )
-
-    clock = pygame.time.Clock()
-
-    print(
-        "Controller Media Player started."
-    )
-    print(
-        "Press a controller button to play media."
-    )
-    print(
-        "Press ESC to exit."
-    )
-    print()
-
+    player = MpvPlayer(blank_image)
     running = True
-
-    direction_controller = DirectionController()
-
     try:
-
+        player.start()
+        print("Persistent fullscreen player ready.")
+        print("Configured buttons:", ", ".join(str(button) for button in sorted(buttons)))
+        player.play(idle_video, loop=True)
+        playing_idle = True
+        next_idle_check = time.monotonic()
         while running:
-
-            # --------------------------------------------------
-            # Pygame events
-            # --------------------------------------------------
-
             for event in pygame.event.get():
-                print( event )
-
                 if event.type == pygame.QUIT:
                     running = False
-
                 elif event.type == pygame.KEYDOWN:
-
                     if event.key == pygame.K_ESCAPE:
                         running = False
+                    elif event.key == pygame.K_SPACE:
+                        player.play(next(iter(buttons.values())))
+                        playing_idle = False
+                elif event.type == pygame.JOYBUTTONDOWN and event.button in buttons:
+                    # loadfile with "replace" restarts the selected video
+                    # from its beginning. A different assigned button swaps
+                    # to its video in the same persistent mpv window.
+                    player.play(buttons[event.button])
+                    playing_idle = False
 
-                elif event.type == pygame.JOYBUTTONDOWN:
-
-                    button = event.button
-
-                    print(
-                        f"Button pressed: {button}"
-                    )
-
-                    media = (
-                        config
-                        .get("buttons", {})
-                        .get(str(button))
-                    )
-
-                    if media is None:
-
-                        print(
-                            f"No media assigned to "
-                            f"button {button}"
-                        )
-
-                        continue
-
-                    player.play(media)
-
-                elif event.type == pygame.JOYHATMOTION:
-
-                    handle_hat_motion(
-                        event,
-                        config,
-                        player
-                    )
-
-                elif event.type == pygame.JOYAXISMOTION:
-
-                    direction = direction_controller.update(event)
-
-                    if direction is not None:
-
-                        print(f"Direction: {direction}")
-
-                        media = (
-                            config
-                            .get("directions", {})
-                            .get(direction)
-                        )
-
-                        if media is not None:
-                            player.play(media)
-
-
-            # --------------------------------------------------
-            # Process GStreamer events.
-            # --------------------------------------------------
-
-            player.process_messages()
-
-            # --------------------------------------------------
-            # DO NOT call pygame.display.flip() here.
-            #
-            # GStreamer is rendering the video directly into
-            # this same window.
-            # --------------------------------------------------
-
-            clock.tick(60)
-
-    except KeyboardInterrupt:
-
-        print(
-            "\nStopping..."
-        )
-
+            # A normal video reaches EOF and makes mpv idle. Return to the
+            # looping idle screen without creating or changing windows.
+            if not playing_idle and time.monotonic() >= next_idle_check:
+                if player.is_idle():
+                    player.play(idle_video, loop=True)
+                    playing_idle = True
+                next_idle_check = time.monotonic() + 0.25
+            pygame.time.wait(10)
     finally:
-
         player.close()
-
         pygame.quit()
+    return 0
 
 
 if __name__ == "__main__":
-
     try:
-        main()
-
+        raise SystemExit(main())
     except Exception as error:
-
         pygame.quit()
-
-        print(
-            f"ERROR: {error}",
-            file=sys.stderr
-        )
-
-        sys.exit(1)
+        print(f"ERROR: {error}", file=sys.stderr)
+        raise SystemExit(1)

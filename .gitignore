@@ -2,4 +2,5 @@
 
 !*.py
 !*.json
+!*.md
 !.gitignore
